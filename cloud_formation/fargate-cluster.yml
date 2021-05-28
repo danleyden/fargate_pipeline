@@ -1,0 +1,345 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: The CloudFormation template for the Fargate ECS Cluster.
+
+Parameters:
+  Stage:
+    Type: String
+  ContainerPort:
+    Type: Number
+  ImageURI:
+    Type: String
+  ProjectName:
+    Type: String
+    Default: my_project
+  Cpu:
+    Type: Number
+    Default: 512 # 1 vcpu == 1024
+  Memory:
+    Type: Number
+    Default: 2048
+  # for autoscaling
+  MinContainers:
+    Type: Number
+    Default: 1
+  # for autoscaling
+  MaxContainers:
+    Type: Number
+    Default: 10
+  # target CPU utilization (%)
+  AutoScalingTargetValue:
+    Type: Number
+    Default: 75
+  ContainerPort:
+    Type: Number
+    Default: 8080
+  LoadBalancerPort:
+     Type: Number
+     Default: 443
+  HealthCheckPath:
+    Type: String
+    Default: /health
+
+Conditions:
+  IsProd: !Equals [!Ref Stage, 'production']
+
+
+Resources:
+  # Create an ECS Cluster
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      Tags:
+        - Key: service
+          Value: !Ref ProjectName
+      ClusterName: !Join ['-', [!Ref Stage, !Ref ProjectName]]
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Base: !If [IsProd, !Ref MinContainers, 0]
+          Weight: !If [IsProd, 50, 0]
+        - CapacityProvider: FARGATE_SPOT
+          Weight: !If [IsProd, 50, 100]
+
+
+  # Create Access Role for ECS-Tasks
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join ['-', [!Ref Stage, !Ref ProjectName, 'ExecutionRole']]
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+      Policies:
+        - PolicyName: !Join ['-', [!Ref Stage, !Ref ProjectName, 'SecretAccess', 'Policy']]
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'secretsmanager:GetSecretValue'
+                Resource:
+                  - !Ref SecretBaseSecret
+                  - !ImportValue {Fn::Join: [':', [!Ref ProjectName, 'databaseConnectionUrl']]}
+                  - !ImportValue {Fn::Join: [':', [!Ref ProjectName, 'psk']]}
+
+  # Create a TaskDefinition with container details
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn: LogGroup
+    Properties:
+      Tags:
+        - Key: service
+          Value: !Ref ProjectName
+      Memory: !Ref Memory
+      Cpu: !Ref Cpu
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - 'FARGATE'
+      TaskRoleArn: !Ref ExecutionRole
+      ExecutionRoleArn: !Ref ExecutionRole
+      Family: !Ref ProjectName
+      ContainerDefinitions:
+        - Name: !Join ['-', [!Ref Stage, !Ref ProjectName, 'Container']]
+          Image: !Ref ImageURI
+          Environment:
+            - Name: RAILS_ENV
+              Value: production
+            - Name: STACK_NAME
+              Value: !ImportValue StackName
+            - Name: ENV_TYPE
+              Value: !ImportValue StackEnvironmentType
+            - Name: PUBLIC_ENDPOINT
+              Value: !Join ['', ['https://', !Ref DNSRecord]]
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+              HostPort: !Ref ContainerPort
+          Secrets:
+            - Name: SECRET_KEY_BASE
+              ValueFrom: !Ref SecretBaseSecret
+            - Name: DATABASE_URL
+              ValueFrom: !ImportValue {Fn::Join: [':', [!Ref ProjectName, 'databaseConnectionUrl']]}
+          StopTimeout: 120
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref AWS::Region
+              awslogs-group: !Ref LogGroup
+              awslogs-stream-prefix: !Join ['-', [!Ref ProjectName, ecs]]
+
+  # Create an ECS Service and add created Cluster, TaskDefintion, Subnets, TargetGroup and SecurityGroup
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn: LoadBalancerListener
+    Properties:
+      Tags:
+        - Key: service
+          Value: !Ref ProjectName
+      ServiceName: !Join ['-', [!Ref Stage, !Ref ProjectName, 'ECSService']]
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinition
+      DeploymentController:
+        Type: ECS
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      HealthCheckGracePeriodSeconds: 30
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !ImportValue PrivateSubnetA
+            - !ImportValue PrivateSubnetB
+            - !ImportValue PrivateSubnetC
+          SecurityGroups:
+            - !Ref ContainerSecurityGroup
+            - !ImportValue { Fn::Join: [':', [!Ref ProjectName, 'databaseAccessSecurityGroup']]}
+      LoadBalancers:
+        - ContainerName: !Join ['-', [!Ref Stage, !Ref ProjectName, 'Container']]
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref TargetGroup
+
+
+  SecretBaseSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: !Join [' ', ['Secret key base for', !Ref ProjectName]]
+      Name: !Join ['/', [!Ref ProjectName, 'secret_key_base']]
+      GenerateSecretString:
+        PasswordLength: 32
+        IncludeSpace: false
+        ExcludePunctuation: true
+
+  AutoScalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join ['', [!Ref ProjectName, AutoScalingRole]]
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceAutoscaleRole'
+
+  AutoScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MinCapacity: !If [IsProd, !Ref MinContainers, 1]
+      MaxCapacity: !Ref MaxContainers
+      ResourceId: !Join ['/', [service, !Ref Cluster, !GetAtt ECSService.Name]]
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+      # "The Amazon Resource Name (ARN) of an AWS Identity and Access Management (IAM) role
+      # that allows Application Auto Scaling to modify your scalable target."
+      RoleARN: !GetAtt AutoScalingRole.Arn
+
+  AutoScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Join ['', [!Ref ProjectName, AutoScalingPolicy]]
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref AutoScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        ScaleInCooldown: 10
+        ScaleOutCooldown: 10
+        # Keep things at or lower than 50% CPU utilization, for example
+        TargetValue: !Ref AutoScalingTargetValue
+
+  ##########################
+  # Logging and Monitoring #
+  ##########################
+
+  # Create Cloudwatch logging
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['-', [!Ref Stage, !Ref ProjectName, ecs]]
+      RetentionInDays: 14
+
+  #################################
+  # Networking and load balancing #
+  #################################
+
+  # Create a security group for load balancer and open port 443 in bound from internet
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Join ['-', [!Ref Stage, !Ref ProjectName, 'LoadBalancerSecurityGroup']]
+      VpcId: !ImportValue VPCID
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  # Create a security group for Containers and open in bound Container port from Load balancer security group to the Container
+  ContainerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Join ['-', [!Ref Stage, !Ref ProjectName, 'ContainerSecurityGroup']]
+      VpcId: !ImportValue VPCID
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+
+  # Create a LoadBalancer and attach the Security group and Subnets
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      IpAddressType: ipv4
+      Name: !Join ['-', [!Ref Stage, !Ref ProjectName]]
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref LoadBalancerSecurityGroup
+      Subnets:
+        - !ImportValue PrivateSubnetA
+        - !ImportValue PrivateSubnetB
+        - !ImportValue PrivateSubnetC
+      Type: application
+
+  # Create a TargetGroup for HTTP port 80
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 10
+      # will look for a 200 status code by default unless specified otherwise
+      HealthCheckPath: !Ref HealthCheckPath
+      HealthCheckTimeoutSeconds: 5
+      UnhealthyThresholdCount: 2
+      HealthyThresholdCount: 2
+      Name: !Join ['-', [!Ref Stage, !Ref ProjectName]]
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: 60 # default is 300
+      TargetType: ip
+      VpcId: !ImportValue VPCID
+
+  # Create a LoadBalancerListener and attach the TargetGroup and LoadBalancer
+  LoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref TargetGroup
+          Type: forward
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: !Ref LoadBalancerPort
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !ImportValue DomainCertificateArn
+
+  LoadBalancerListenerRedirect:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: redirect
+          RedirectConfig:
+            Protocol: HTTPS
+            Port: 443
+            Host: "#{host}"
+            Path: "/#{path}"
+            Query: "#{query}"
+            StatusCode: HTTP_301
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  DNSRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneName: !Join ['', [!ImportValue DomainName, .]]
+      Name: !Join ['', [!Ref ProjectName, ., !ImportValue DomainName, .]]
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt LoadBalancer.DNSName
+        HostedZoneId: !GetAtt LoadBalancer.CanonicalHostedZoneID
+
+#######################
+# Outputs and exports #
+#######################
+
+Outputs:
+  Endpoint:
+    Description: Endpoint
+    Value: !Join ['', ['https://', !Ref DNSRecord]]

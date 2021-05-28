@@ -1,0 +1,99 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Template to configure a database for the project
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'my_project'
+  DBUsername:
+    NoEcho: 'true'
+    Description: Username for database access
+    Type: String
+    MinLength: '1'
+    MaxLength: '16'
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9]*'
+    ConstraintDescription: must begin with a letter and contain only alphanumeric characters.
+  DBPassword:
+    NoEcho: 'true'
+    Description: Password database access
+    Type: String
+    MinLength: '8'
+    MaxLength: '41'
+    AllowedPattern: '[a-zA-Z0-9]*'
+    ConstraintDescription: must contain only alphanumeric characters.
+  MinCapacity:
+    Type: Number
+    Default: 2
+  MaxCapacity:
+    Type: Number
+    Default: 16
+
+Resources:
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for databases
+      SubnetIds:
+        - !ImportValue PrivateSubnetA
+        - !ImportValue PrivateSubnetB
+        - !ImportValue PrivateSubnetC
+
+  AccessSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Join ['-', [!Ref ProjectName, 'DB', 'Access', '2']]
+      GroupDescription: !Join [ ' ', ['Allow access to', !Ref ProjectName, 'db servers']]
+      VpcId: !ImportValue VPCID
+
+  DBServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      SecurityGroupIngress:
+        - SourceSecurityGroupId: !GetAtt [AccessSecurityGroup, 'GroupId']
+          FromPort: 5432
+          ToPort: 5432
+          IpProtocol: tcp
+      GroupName: !Join ['-', [!Ref ProjectName, 'DB', 'Servers']]
+      GroupDescription: !Join [ ' ', [!Ref ProjectName, 'DB Servers sec grp']]
+      VpcId: !ImportValue VPCID
+
+  DBCluster:
+    Type: AWS::RDS::DBCluster
+    Properties:
+      MasterUsername: 
+        Ref: DBUsername
+      MasterUserPassword: 
+        Ref: DBPassword
+      BackupRetentionPeriod: 14
+      DatabaseName: !Ref ProjectName
+      Engine: aurora-postgresql
+      EngineMode: serverless
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      ScalingConfiguration:
+        AutoPause: true
+        MaxCapacity: !Ref MaxCapacity
+        MinCapacity: !Ref MinCapacity
+        SecondsUntilAutoPause: 300
+      VpcSecurityGroupIds:
+        - !GetAtt DBServerSecurityGroup.GroupId
+
+  DBURLSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties: 
+      Description: !Join [' ', ['Database url for', !Ref ProjectName]]
+      Name: !Join ['/', [!Ref ProjectName, 'database_url']]
+      SecretString: !Join ['', ['postgres://', !Ref DBUsername, ':', !Ref DBPassword, '@', !GetAtt [DBCluster, 'Endpoint.Address'], '/', !Ref ProjectName]]
+
+Outputs:
+  DBAddress:
+    Value: !GetAtt [DBCluster, 'Endpoint.Address']
+    Export:
+      Name: !Join [':', [!Ref ProjectName, 'databaseUri']]
+  DATABASEURL:
+    Value: !Ref DBURLSecret
+    Export:
+      Name: !Join [':', [!Ref ProjectName, 'databaseConnectionUrl']]
+  SecurityGroup:
+    Value: !Ref AccessSecurityGroup
+    Export:
+      Name: !Join [':', [!Ref ProjectName, 'databaseAccessSecurityGroup']]

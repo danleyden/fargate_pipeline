@@ -1,0 +1,294 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: The CloudFormation template for the CodePipeline.
+
+Parameters:
+  Stage:
+    Type: String
+    Default: dev
+  ProjectName:
+    Type: String
+    Default: my_project
+  CodestarConnectionArn:
+    Type: String
+    Default: <PLACE_HOLDER>
+  CodeRepoName:
+    Type: String
+    Default: my-github-org/my_project
+  CodeBranch:
+    Type: String
+    Default: main
+  BaseImage:
+    Type: String
+    Default: <DEFAULT>
+  ContainerPort:
+    Type: Number
+    Default: 8080
+
+Conditions:
+  BaseImageProvided: !Not [!Equals ['<DEFAULT>', !Ref BaseImage]]
+
+Resources:
+
+  # Create an ECR Repository to store docker images
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Join ['-', [!Ref ProjectName]]
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "action": {
+                  "type": "expire"
+                },
+                "selection": {
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 10,
+                  "tagStatus": "tagged",
+                  "tagPrefixList": [
+                    "dev",
+                    "test"
+                  ]
+                },
+                "description": "Remove dev and test images after 10 days",
+                "rulePriority": 1
+              },
+              {
+                "action": {
+                  "type": "expire"
+                },
+                "selection": {
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 5,
+                  "tagStatus": "tagged",
+                  "tagPrefixList": [
+                    "prod"
+                  ]
+                },
+                "description": "expire old prod images",
+                "rulePriority": 2
+              }
+            ]
+          }
+
+  # Create an S3 Bucket to store build artifacts
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Join ['-', [!Ref Stage, !Ref 'AWS::AccountId', !Ref ProjectName]]
+
+  # Create Access Role for CodePipeLine
+  CodePipeLineExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AdministratorAccess'
+
+  # Create Access Role for CodeBuild
+  CodeBuildExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: codebuild.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+
+  # Create Access Role for Cloudformation
+  CloudformationExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AdministratorAccess'
+
+  # CloudWatch Log Group for codebuild
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['/', ['codebuild', !Ref ProjectName]]
+      RetentionInDays: 14
+
+  # Create the BuildProject with required Build information
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Cache:
+        Type: LOCAL
+        Modes: [ LOCAL_DOCKER_LAYER_CACHE ]
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+        ImagePullCredentialsType: CODEBUILD
+        PrivilegedMode: True
+        Type: LINUX_CONTAINER
+        EnvironmentVariables:
+          - Name: ECR_REPOSITORY_URI
+            Value: !Join [ ".", [ !Ref "AWS::AccountId", "dkr.ecr", !Ref "AWS::Region", !Join [ "/", [ "amazonaws.com", !Ref "ECRRepository" ] ] ] ]
+          - Name: BASE_IMAGE
+            Value: !If [BaseImageProvided, !Ref BaseImage, !ImportValue 'railscontainer:ECRRepository']
+          - Name: Stage
+            Value: !Ref Stage
+      Name: !Join ['-', [!Ref Stage, !Ref ProjectName, 'build']]
+      ServiceRole: !Ref CodeBuildExecutionRole
+      Source:
+        Type: CODEPIPELINE
+        # This file (buildspec.yml In Source code) contains commands to Create and Push a docker image to the ECR_REPOSITORY_URI
+        BuildSpec: buildspec.yml
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref LogGroup
+
+  # Create CodePipeline with 3 stages (Source, Build and Deploy)
+  CodePipeLine:
+    Type: AWS::CodePipeline::Pipeline
+    DependsOn: S3Bucket
+    Properties:
+      ArtifactStore:
+        Location: !Join ['-', [!Ref Stage, !Ref 'AWS::AccountId', !Ref ProjectName]]
+        Type: S3
+      Name: !Join ['-', [!Ref Stage, !Ref 'AWS::AccountId', 'CodePipeLine', !Ref ProjectName]]
+      RestartExecutionOnUpdate: False
+      RoleArn:
+        Fn::GetAtt: [ CodePipeLineExecutionRole, Arn ]
+
+      Stages:
+
+        # Download source code from Repo to source-output-artifacts path in S3 Bucket
+        - Name: Source
+          Actions:
+          - Name: Source
+            ActionTypeId:
+              Category: Source
+              Owner: AWS
+              Provider: CodeStarSourceConnection
+              Version: 1
+            Configuration:
+              ConnectionArn: !Ref CodestarConnectionArn
+              FullRepositoryId: !Ref CodeRepoName
+              BranchName: !Ref CodeBranch
+            RunOrder: 1
+            OutputArtifacts:
+              - Name: source-output-artifacts
+
+        # Build the project using the BuildProject and Output build artifacts to build-output-artifacts path in S3 Bucket
+        - Name: Build
+          Actions:
+          - Name: Build
+            ActionTypeId:
+              Category: Build
+              Owner: AWS
+              Version: 1
+              Provider: CodeBuild
+            OutputArtifacts:
+              - Name: build-output-artifacts
+            InputArtifacts:
+              - Name: source-output-artifacts
+            Configuration:
+                ProjectName: !Ref BuildProject
+            RunOrder: 1
+
+        # Deploy the project by executing Fargate-Cluster.yml file in the Source code with Cloudformation.
+        - Name: Deploy
+          Actions:
+          - Name: Deploy
+            ActionTypeId:
+              Category: Deploy
+              Owner: AWS
+              Version: 1
+              Provider: CloudFormation
+            InputArtifacts:
+              - Name: source-output-artifacts
+              - Name: build-output-artifacts
+            Configuration:
+                ActionMode: CREATE_UPDATE
+                Capabilities: CAPABILITY_NAMED_IAM
+                # Pass parameter values to Fargate-Cluster.yml for deployment
+                ParameterOverrides: !Sub |
+                  {
+                    "ImageURI" : { "Fn::GetParam" : ["build-output-artifacts", "imageDetail.json", "ImageURI"] },
+                    "Stage":  "${Stage}",
+                    "ContainerPort": "${ContainerPort}"
+                  }
+                RoleArn:
+                  Fn::GetAtt: [ CloudformationExecutionRole, Arn ]
+                StackName: !Join ['-', [!Ref Stage, !Ref ProjectName, 'FargateECSCluster']]
+                TemplatePath: source-output-artifacts::cloud_formation/fargate-cluster.yml
+            RunOrder: 1
+
+  # Notification channels for pipeline events
+
+  BuildNotificationTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref BuildNotificationTopic
+      PolicyDocument:
+        Id: !Join ['', ['BuildPublisher', !Ref BuildNotificationTopic]]
+        Statement:
+          - Effect: Allow
+            Sid: !Join ['', ['BuildPublisher', !Ref BuildNotificationTopic, 'Publish']]
+            Action:
+              - "SNS:Publish"
+            Principal:
+              Service: codestar-notifications.amazonaws.com
+            Resource: !Ref BuildNotificationTopic
+          - Effect: Allow
+            Sid: !Join ['', ['BuildPublisher', !Ref BuildNotificationTopic, 'Receive']]
+            Action:
+              - "SNS:Subscribe"
+              - "SNS:Receive"
+            Principal:
+              AWS: "*"
+            Resource: !Ref BuildNotificationTopic
+            Condition:
+              StringEquals:
+                "AWS:SourceOwner": !Ref 'AWS::AccountId'
+
+  BuildNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !Join [' ', ['build for ', !Ref Stage, !Ref ProjectName]]
+      TopicName: !Join ['-', ['build', !Ref Stage, !Ref ProjectName]]
+
+  BuildNotificationRule:
+    Type: AWS::CodeStarNotifications::NotificationRule
+    Properties:
+      DetailType: FULL
+      Name: !Join [' ', ['pipeline notifications for', !Ref Stage, !Ref ProjectName]]
+      Resource: !Join ['', ['arn:aws:codepipeline:', !Ref 'AWS::Region', ':', !Ref 'AWS::AccountId', ':', !Ref CodePipeLine]]
+      EventTypeIds:
+        - codepipeline-pipeline-stage-execution-failed
+        - codepipeline-pipeline-pipeline-execution-started
+        - codepipeline-pipeline-pipeline-execution-succeeded
+        - codepipeline-pipeline-pipeline-execution-superseded
+        - codepipeline-pipeline-pipeline-execution-failed
+      Targets:
+        - TargetType: SNS
+          TargetAddress: !Ref BuildNotificationTopic
+Outputs:
+  ProjectName:
+    Value: !Ref ProjectName
+  ECRRepository:
+    Value: !Ref "ECRRepository"
+    Export:
+      Name: !Join ["-", [!Ref ProjectName, "ECRRepository"]]
